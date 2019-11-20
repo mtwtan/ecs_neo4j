@@ -1,0 +1,466 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  AppName:
+    Type: String
+    Description: Name of application
+    Default: "neo4j"
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances
+  DesiredCapacity:
+    Type: Number
+    Default: '1'
+    Description: Number of instances to launch in your ECS cluster
+  InstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: m5.large
+    AllowedValues:
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  LoadBalancerName:
+    Description: Give a name for your network load balancer
+    Type: String
+    Default: "lb-neo4j-test"
+  SSHLocation:
+    Description: " The IP address range that can be used to SSH to the EC2 instances"
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  VPC:
+    Description: Select existing VPC
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+     Description: Enter the CIDR Range for your VPC
+     Type: AWS::EC2::Subnet::Id
+  ECSAMI:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id"
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        Ref: VPC
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp:
+          Ref: SSHLocation
+      - IpProtocol: tcp
+        FromPort: '7474'
+        ToPort: '7474'
+        CidrIp:
+          Ref: SSHLocation
+      - IpProtocol: tcp
+        FromPort: '7687'
+        ToPort: '7687'
+        CidrIp:
+          Ref: SSHLocation
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join [ "-", [ "cluster-", !Ref AppName ] ]
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones:
+      - Fn::Select:
+        - '0'
+        - Fn::GetAZs:
+            Ref: AWS::Region
+      VPCZoneIdentifier:
+      - Ref: Subnet1
+      LaunchConfigurationName:
+        Ref: ContainerInstances
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      Tags:
+      - Key: Name
+        Value: ECS host
+        PropagateAtLaunch: 'true'
+      TargetGroupARNs: 
+      - !Ref TargetGroup7474
+      - !Ref TargetGroup7687
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT15M
+        WaitOnResourceSignals: 'true'
+        SuspendProcesses:
+        - HealthCheck
+        - ReplaceUnhealthy
+        - AZRebalance
+        - AlarmNotification
+        - ScheduledActions
+  ContainerInstances:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId:
+        Ref: ECSAMI
+      InstanceType:
+        Ref: InstanceType
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      KeyName:
+        Ref: KeyName
+      AssociatePublicIpAddress: true
+      SecurityGroups:
+      - Ref: InstanceSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: "#!/bin/bash\nyum install -y aws-cfn-bootstrap\n/opt/aws/bin/cfn-init
+            -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ContainerInstances\n/opt/aws/bin/cfn-signal
+            -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup\n\nexec
+            2>>/var/log/ecs/ecs-agent-install.log\nset -x\nuntil curl -s http://localhost:51678/v1/metadata\ndo\n
+            \  sleep 1\ndone\ndocker plugin install rexray/ebs REXRAY_PREEMPT=true
+            EBS_REGION=us-east-2 --grant-all-permissions\nstop ecs \nstart ecs\n
+            instid=$(curl http://169.254.169.254/latest/dynamic/instance-identity/document | jq .instanceId | sed 's/\"//g')\n
+            aws ec2 attach-volume --volume-id vol-XXXXXXXX --instance-id $instid --device /dev/sdf --region ${AWS::Region}\n
+            sleep 10 \n
+            if [ ! -d /data ]; then mkdir /data; fi\n
+            mount /dev/nvme2n1 /data\n
+            sleep 10 \n
+            if [ ! -d /data/plugins ]; then mkdir -p /data/plugins; fi\n
+            if [ ! -d /data/import ]; then mkdir -p /data/import; fi\n
+            if [ ! -d /data/data ]; then mkdir -p /data/data; fi\n"
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              aws-cli: []
+              jq: []
+              ecs-init: []
+          commands:
+            01_add_instance_to_cluster:
+              command:
+                Fn::Sub: echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            02_start_ecs_agent:
+              command: start ecs
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              mode: 256
+              owner: root
+              group: root
+              content:
+                Fn::Sub: |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                Fn::Sub: |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ContainerInstances
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - "/etc/cfn/cfn-hup.conf"
+                - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+  TaskDefinition: 
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "EC2"
+      ContainerDefinitions:
+        - 
+          Name: !Ref AppName
+          MountPoints: 
+            -
+              SourceVolume: "data"
+              ContainerPath: "/data"
+            -
+              SourceVolume: "import"
+              ContainerPath: "/data/import"
+            -
+              SourceVolume: "plugins"
+              ContainerPath: "/data/plugins"
+          Image: "neo4j:3.5.11"
+          Cpu: 1024
+          Memory: 4500
+#          DependsOn:
+#            - ContainerName: neo4j
+#              Condition: START
+          PortMappings:
+            - 
+              HostPort: 7474
+              Protocol: TCP
+              ContainerPort: 7474
+            - 
+              HostPort: 7687
+              Protocol: TCP
+              ContainerPort: 7687
+          Environment:
+            - 
+              Name: NEO4J_apoc_import_file_enabled
+              Value: 'true'
+            - 
+              Name: NEO4J_AUTH
+              Value: none
+            - 
+              Name: NEO4J_dbms_memory_heap_max__size
+              Value: 4G
+            - 
+              Name: NEO4J_dbms_security_procedures_unrestricted
+              Value: apoc.*
+            - 
+              Name: NEO4J_dbms_shell_enabled
+              Value: 'true'
+      NetworkMode: "bridge"
+      Memory: 5000
+      Cpu: 1024
+      Volumes:
+        -
+          Host:
+            SourcePath: "/data/data" 
+          Name: "data"
+        -
+          Host:
+            SourcePath: "/data/import"
+          Name: "import"
+        -
+          Host:
+            SourcePath: "/data/plugins"
+          Name: "plugins"
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 0
+      ServiceName: neo4j
+#      Role: !Ref EC2Role
+      LoadBalancers:
+        - 
+          ContainerName: !Ref AppName
+          ContainerPort: 7474
+          TargetGroupArn: !Ref TargetGroup7474
+        - 
+          ContainerName: !Ref AppName
+          ContainerPort: 7687
+          TargetGroupArn: !Ref TargetGroup7687
+      PlacementStrategies:
+        - Type: binpack
+          Field: memory
+        - Type: spread
+          Field: host
+      TaskDefinition: !Ref TaskDefinition
+    DependsOn: 
+      - Listener7474
+      - Listener7687
+  elb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: !Ref LoadBalancerName
+      Type: network
+      Subnets:
+        - !Ref Subnet1
+  TargetGroup7474:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: neo4j-7474
+      Protocol: TCP
+      VpcId: !Ref VPC
+      Port: 7474
+      TargetType: instance
+    DependsOn: elb
+  TargetGroup7687:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: neo4j-7687
+      Protocol: TCP
+      VpcId: !Ref VPC
+      Port: 7687
+      TargetType: instance
+    DependsOn: elb
+  Listener7474:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    DependsOn: EC2Role
+    Properties:
+      DefaultActions:
+        - 
+          Type: "forward"
+          TargetGroupArn: !Ref TargetGroup7474
+      LoadBalancerArn: !Ref elb
+      Port: '7474'
+      Protocol: TCP
+  Listener7687:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    DependsOn: EC2Role
+    Properties:
+      DefaultActions:
+        - 
+          Type: "forward"
+          TargetGroupArn: !Ref TargetGroup7687
+      LoadBalancerArn: !Ref elb
+      Port: '7687'
+      Protocol: TCP
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument: |
+        {
+          "Statement": [{
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              }
+            },
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "elasticloadbalancing.amazonaws.com"
+              }
+            }]
+        }
+      Policies:
+      - PolicyName: ECSforEC2InstanceRolePolicy
+        PolicyDocument: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecs:CreateCluster",
+                  "ecs:DeregisterContainerInstance",
+                  "ecs:DiscoverPollEndpoint",
+                  "ecs:Poll",
+                  "ecs:RegisterContainerInstance",
+                  "ecs:StartTelemetrySession",
+                  "ecs:Submit*",
+                  "ecr:GetAuthorizationToken",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+      - PolicyName: RexrayPolicy
+        PolicyDocument: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "ec2:AttachVolume",
+                "ec2:CreateVolume",
+                "ec2:CreateSnapshot",
+                "ec2:CreateTags",
+                "ec2:DeleteVolume",
+                "ec2:DeleteSnapshot",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DescribeInstances",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeVolumeAttribute",
+                "ec2:DescribeVolumeStatus",
+                "ec2:DescribeSnapshots",
+                "ec2:CopySnapshot",
+                "ec2:DescribeSnapshotAttribute",
+                "ec2:DetachVolume",
+                "ec2:ModifySnapshotAttribute",
+                "ec2:ModifyVolumeAttribute",
+                "ec2:DescribeTags"
+              ],
+              "Resource": "*"
+            }]
+          }
+      - PolicyName: ELBecsPolicy
+        PolicyDocument: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:Describe*",
+                "elasticloadbalancing:*"
+              ],
+              "Resource": "*"
+            }]
+          }
+  ECSServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - application-autoscaling.amazonaws.com
+      Path: "/"
+      Policies:
+      - PolicyName: ecs-service-autoscaling
+        PolicyDocument:
+          Statement:
+            Effect: Allow
+            Action:
+            - application-autoscaling:*
+            - cloudwatch:DescribeAlarms
+            - cloudwatch:PutMetricAlarm
+            - ecs:DescribeServices
+            - ecs:UpdateService
+            Resource: "*"
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: EC2Role
+  CWLogsGroup:
+    Type: AWS::Logs::LogGroup
+Outputs:
+  AWSRegion:
+    Description: The name of the region where the stack was launched
+    Value:
+      Ref: AWS::Region
+  ECSClusterName:
+    Description: The name of the ECS cluster
+    Value:
+      Ref: ECSCluster
+  CWLogGroupName:
+    Description: The name of the CWLogs group
+    Value:
+      Ref: CWLogsGroup
+  SubnetId:
+    Description: The ID of the subnet that the instances are associated with
+    Value:
+      Ref: Subnet1
+  SecurityGroupId:
+    Description: The ID of security group that the instances are members of
+    Value:
+      Ref: InstanceSecurityGroup
